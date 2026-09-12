@@ -38,7 +38,8 @@ func writeErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrNotFound):
 		writeJSON(w, http.StatusNotFound, errBody{err.Error()})
-	case errors.Is(err, ErrFencing), errors.Is(err, ErrNotLeaseHolder), errors.Is(err, ErrAlreadyDone):
+	case errors.Is(err, ErrFencing), errors.Is(err, ErrNotLeaseHolder),
+		errors.Is(err, ErrAlreadyDone), errors.Is(err, ErrLeaseExpired):
 		writeJSON(w, http.StatusConflict, errBody{err.Error()})
 	default:
 		writeJSON(w, http.StatusInternalServerError, errBody{err.Error()})

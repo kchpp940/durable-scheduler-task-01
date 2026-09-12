@@ -26,6 +26,7 @@ var (
 	ErrNoTask         = errors.New("no task available")
 	ErrFencing        = errors.New("stale fencing token: lease held by a newer execution")
 	ErrNotLeaseHolder = errors.New("caller does not hold the current lease")
+	ErrLeaseExpired   = errors.New("lease has expired: execution eligibility is lost")
 	ErrAlreadyDone    = errors.New("task already completed with a different result")
 )
 
@@ -308,7 +309,9 @@ func (c *Core) Claim(workerID string, leaseDur time.Duration) (*Task, error) {
 	return &cp, nil
 }
 
-// checkLeaseLocked validates the fencing token for a mutation.
+// checkLeaseLocked validates the fencing token for a mutation. It does
+// not check lease expiry; callers that mutate must also verify the lease
+// is still live via checkLeaseLiveLocked.
 func (c *Core) checkLeaseLocked(id, workerID string, token uint64) (*Task, error) {
 	t, ok := c.tasks[id]
 	if !ok {
@@ -324,16 +327,33 @@ func (c *Core) checkLeaseLocked(id, workerID string, token uint64) (*Task, error
 	return t, nil
 }
 
-// Renew extends a lease. Late renewals from stale tokens are rejected.
-func (c *Core) Renew(id, workerID string, token uint64, leaseDur time.Duration) (*Task, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// checkLeaseLiveLocked verifies the caller holds the current token AND the
+// lease has not expired. An expired lease is dead: the old execution must
+// not regain eligibility by renewing or completing, even if no other
+// worker has taken over yet.
+func (c *Core) checkLeaseLiveLocked(id, workerID string, token uint64) (*Task, error) {
 	t, err := c.checkLeaseLocked(id, workerID, token)
 	if err != nil {
 		return nil, err
 	}
 	if t.State != StateLeased {
 		return nil, ErrFencing
+	}
+	if t.LeaseExpiry <= c.now().UnixNano() {
+		return nil, ErrLeaseExpired
+	}
+	return t, nil
+}
+
+// Renew extends a lease. Late renewals from stale tokens are rejected, and
+// renewals after the lease has expired are rejected even when the token is
+// still current: an expired lease cannot be revived.
+func (c *Core) Renew(id, workerID string, token uint64, leaseDur time.Duration) (*Task, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t, err := c.checkLeaseLiveLocked(id, workerID, token)
+	if err != nil {
+		return nil, err
 	}
 	expiry := c.now().Add(leaseDur).UnixNano()
 	rec := renewRec{ID: id, Token: token, Expiry: expiry, AppliedAt: c.now().UnixNano()}
@@ -362,7 +382,7 @@ func (c *Core) Complete(id, workerID string, token uint64, result string) (*Task
 		}
 		return nil, ErrAlreadyDone
 	}
-	if _, err := c.checkLeaseLocked(id, workerID, token); err != nil {
+	if _, err := c.checkLeaseLiveLocked(id, workerID, token); err != nil {
 		return nil, err
 	}
 	rec := completeRec{ID: id, Token: token, Owner: workerID, Result: result, AppliedAt: c.now().UnixNano()}
