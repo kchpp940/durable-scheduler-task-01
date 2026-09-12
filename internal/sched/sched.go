@@ -351,7 +351,7 @@ func (c *Core) checkLeaseLiveLocked(id, workerID string, token uint64) (*Task, e
 func (c *Core) Renew(id, workerID string, token uint64, leaseDur time.Duration) (*Task, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	t, err := c.checkLeaseLiveLocked(id, workerID, token)
+	_, err := c.checkLeaseLiveLocked(id, workerID, token)
 	if err != nil {
 		return nil, err
 	}

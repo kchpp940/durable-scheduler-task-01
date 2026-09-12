@@ -195,6 +195,24 @@ func TestWorkerDeathAndLateSubmission(t *testing.T) {
 	// Worker A claims with a short lease and "dies".
 	_, a := claim(t, addr, "worker-A", 50)
 	tokenA := uint64(a["token"].(float64))
+	expiryA := int64(a["lease_expiry"].(float64))
+	// After expiry but BEFORE any takeover, A's renew/complete must already
+	// be rejected: an expired lease cannot be revived.
+	waitFor(t, "A's lease expired", func() bool {
+		return time.Now().UnixNano() > expiryA
+	})
+	code, _ := post(t, addr, "/tasks/"+id+"/renew", map[string]any{
+		"worker_id": "worker-A", "token": tokenA, "lease_ms": 60000,
+	})
+	if code != http.StatusConflict {
+		t.Fatalf("renew with expired lease: %d", code)
+	}
+	code, _ = post(t, addr, "/tasks/"+id+"/complete", map[string]any{
+		"worker_id": "worker-A", "token": tokenA, "result": "A-early",
+	})
+	if code != http.StatusConflict {
+		t.Fatalf("complete with expired lease: %d", code)
+	}
 	// Worker B takes over after expiry and completes.
 	var b map[string]any
 	waitFor(t, "B takes over", func() bool {
@@ -206,7 +224,7 @@ func TestWorkerDeathAndLateSubmission(t *testing.T) {
 		return false
 	})
 	tokenB := uint64(b["token"].(float64))
-	code, _ := post(t, addr, "/tasks/"+id+"/complete", map[string]any{
+	code, _ = post(t, addr, "/tasks/"+id+"/complete", map[string]any{
 		"worker_id": "worker-B", "token": tokenB, "result": "B-result",
 	})
 	if code != http.StatusOK {
@@ -373,14 +391,14 @@ func TestCompactionUnderRealProcess(t *testing.T) {
 		}
 	}
 	// The pre-kill lease holder can still complete with its fencing token.
-	code, _ := post(t, addr, "/tasks/"+liveID+"/complete", map[string]any{
+	code, _ = post(t, addr, "/tasks/"+liveID+"/complete", map[string]any{
 		"worker_id": "w", "token": liveToken, "result": "final",
 	})
 	if code != http.StatusOK {
 		t.Fatalf("complete live task after recovery: %d", code)
 	}
 	// Idempotency keys survived compaction: duplicate create returns same task.
-	code, dup = post(t, addr, "/tasks", map[string]any{"idempotency_key": "c0", "payload": "p"})
+	code, dup := post(t, addr, "/tasks", map[string]any{"idempotency_key": "c0", "payload": "p"})
 	if code != http.StatusOK {
 		t.Fatalf("idempotent create after compaction: %d", code)
 	}

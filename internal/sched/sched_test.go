@@ -245,3 +245,126 @@ func TestCompactionRoundTrip(t *testing.T) {
 		t.Fatal("idempotency key lost across compaction")
 	}
 }
+
+func TestExpiredLeaseCannotRevive(t *testing.T) {
+	c, _ := openCore(t)
+	c.Create("", "job")
+	t1, _ := c.Claim("w1", 20*time.Millisecond)
+	// Lease expires with no takeover. The old holder must not revive its
+	// execution eligibility by renewing or completing.
+	waitFor(t, "lease expiry", func() bool {
+		return c.now().UnixNano() > t1.LeaseExpiry
+	})
+	if _, err := c.Renew(t1.ID, "w1", t1.Token, time.Minute); !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("renew after expiry: %v", err)
+	}
+	if _, err := c.Complete(t1.ID, "w1", t1.Token, "zombie"); !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("complete after expiry: %v", err)
+	}
+	// Task is still pending-ish and claimable by a new worker.
+	t2, err := c.Claim("w2", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if t2.Token <= t1.Token {
+		t.Fatalf("token did not advance: %d -> %d", t1.Token, t2.Token)
+	}
+	// After takeover the old instance is fully isolated.
+	if _, err := c.Renew(t1.ID, "w1", t1.Token, time.Minute); !errors.Is(err, ErrFencing) {
+		t.Fatalf("stale renew after takeover: %v", err)
+	}
+	if _, err := c.Complete(t1.ID, "w1", t1.Token, "zombie"); !errors.Is(err, ErrFencing) {
+		t.Fatalf("stale complete after takeover: %v", err)
+	}
+	// New instance works normally.
+	if _, err := c.Renew(t2.ID, "w2", t2.Token, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Complete(t2.ID, "w2", t2.Token, "real"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := c.Get(t1.ID)
+	if got.State != StateCompleted || got.Result != "real" {
+		t.Fatalf("final state: %+v", got)
+	}
+}
+
+func TestExpiredLeaseSemanticsAcrossRestart(t *testing.T) {
+	c, dir := openCore(t)
+	c.Create("", "job")
+	t1, _ := c.Claim("w1", 30*time.Millisecond)
+	c.Close() // restart while the lease is still valid on disk
+
+	// Reopen after the persisted lease expiry has passed.
+	waitFor(t, "persisted lease expiry", func() bool {
+		return time.Now().UnixNano() > t1.LeaseExpiry
+	})
+	c2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	// The expired lease stays expired after recovery: no revive.
+	if _, err := c2.Renew(t1.ID, "w1", t1.Token, time.Minute); !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("renew after restart+expiry: %v", err)
+	}
+	if _, err := c2.Complete(t1.ID, "w1", t1.Token, "zombie"); !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("complete after restart+expiry: %v", err)
+	}
+	// A new worker takes over with a strictly larger fencing token.
+	t2, err := c2.Claim("w2", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if t2.Token <= t1.Token {
+		t.Fatalf("fencing token regressed across restart: %d -> %d", t1.Token, t2.Token)
+	}
+	// Old instance is fenced off; new instance completes.
+	if _, err := c2.Complete(t1.ID, "w1", t1.Token, "zombie"); !errors.Is(err, ErrFencing) {
+		t.Fatalf("stale complete after restart+takeover: %v", err)
+	}
+	if _, err := c2.Complete(t2.ID, "w2", t2.Token, "real"); err != nil {
+		t.Fatal(err)
+	}
+	// Restart once more: the terminal state and fencing survive.
+	c2.Close()
+	c3, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c3.Close()
+	got, _ := c3.Get(t1.ID)
+	if got.State != StateCompleted || got.Result != "real" {
+		t.Fatalf("terminal state after second restart: %+v", got)
+	}
+	if _, err := c3.Complete(t1.ID, "w1", t1.Token, "zombie"); !errors.Is(err, ErrAlreadyDone) && !errors.Is(err, ErrFencing) {
+		t.Fatalf("zombie complete after second restart: %v", err)
+	}
+	if _, err := c3.Claim("w3", time.Minute); !errors.Is(err, ErrNoTask) {
+		t.Fatalf("completed task re-claimed after restart: %v", err)
+	}
+}
+
+func TestLiveLeaseRenewalPersistsAcrossRestart(t *testing.T) {
+	c, dir := openCore(t)
+	c.Create("", "job")
+	t1, _ := c.Claim("w1", time.Hour)
+	// Renew extends the persisted expiry.
+	if _, err := c.Renew(t1.ID, "w1", t1.Token, 2*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+
+	c2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	// Renewed lease is still live: holder can complete, others cannot claim.
+	if _, err := c2.Claim("w2", time.Minute); !errors.Is(err, ErrNoTask) {
+		t.Fatalf("renewed lease not honored after restart: %v", err)
+	}
+	if _, err := c2.Complete(t1.ID, "w1", t1.Token, "done"); err != nil {
+		t.Fatalf("complete with renewed lease after restart: %v", err)
+	}
+}
